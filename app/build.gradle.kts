@@ -62,7 +62,8 @@ dependencies {
     val composeBom = platform("androidx.compose:compose-bom:2024.02.00")
     implementation(composeBom)
     androidTestImplementation(composeBom)
-
+    implementation("androidx.media3:media3-exoplayer:1.2.1")
+    implementation("androidx.media3:media3-ui:1.2.1")
     // Core Compose UI
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.material3:material3")
@@ -71,4 +72,5 @@ dependencies {
     // Activity Compose and Lifecycle
     implementation("androidx.activity:activity-compose:1.8.2")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.7.0")
+    implementation(project(":whisperlib"))
 }

@@ -22,4 +22,5 @@ dependencyResolutionManagement {
 
 rootProject.name = "TiktokDL"
 include(":app")
- 
+include(":lib")
+include(":whisperlib")

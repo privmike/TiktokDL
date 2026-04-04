@@ -1,10 +1,16 @@
 package com.privmike.tiktokdl
 
+import com.whispercpp.whisper.WhisperContext
 import android.annotation.SuppressLint
 import android.app.DownloadManager
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.os.Environment
 import android.util.Log
@@ -16,6 +22,7 @@ import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.grid.GridCells
@@ -35,13 +42,21 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
+import com.arthenica.ffmpegkit.FFmpegKit
+import com.arthenica.ffmpegkit.ReturnCode
 import com.privmike.tiktokdl.data.AppDatabase
 import com.privmike.tiktokdl.data.SavedVideo
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.File
+import java.io.FileOutputStream
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.util.regex.Pattern
 
 class MainActivity : ComponentActivity() {
@@ -57,11 +72,22 @@ class MainActivity : ComponentActivity() {
     // Define the User-Agent we'll use for both WebView and Downloading
     private val DESKTOP_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 
+    private var currentDownloadId: Long = -1L
+    private var currentDownloadFileName: String = ""
+    // Add this near your other state variables like `isExtracting`
+    private var translationProgressText by mutableStateOf<String?>(null)
+    // This keeps track of which video belongs to which download!
+    private val pendingDownloads = mutableMapOf<Long, SavedVideo>()
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         setupHiddenWebView()
 
+        registerReceiver(
+            downloadCompleteReceiver,
+            IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE),
+            Context.RECEIVER_EXPORTED // Needed for newer Android versions
+        )
         setContent {
             MaterialTheme {
                 Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
@@ -195,6 +221,7 @@ class MainActivity : ComponentActivity() {
         isLoggedIn = checkTiktokLoginStatus()
     }
 
+
     private fun checkTiktokLoginStatus(): Boolean {
         val cookieManager = CookieManager.getInstance()
         val cookies = cookieManager.getCookie("https://www.tiktok.com")
@@ -311,51 +338,100 @@ class MainActivity : ComponentActivity() {
     private fun saveVideoToCollection(url: String, collectionName: String) {
         Toast.makeText(this, "Downloading to $collectionName...", Toast.LENGTH_SHORT).show()
 
-        // Trigger the download immediately
-        triggerDownload(this, url)
-
-        // Run the database save on a background thread so we don't freeze the UI
         lifecycleScope.launch(Dispatchers.IO) {
-            val db = AppDatabase.getDatabase(this@MainActivity)
-            db.videoDao().insertVideo(SavedVideo(videoUrl = url, collectionName = collectionName))
+            // 1. Generate the filename and exact path FIRST
+            val fileName = "TikTok_${System.currentTimeMillis()}.mp4"
+            val expectedFile = File(getExternalFilesDir(Environment.DIRECTORY_MOVIES), "TikTokDL/$fileName")
 
-            // Switch back to the Main thread to close the app UI after a short delay
-            withContext(Dispatchers.Main) {
-                delay(500)
-                finish()
-            }
+            // 2. Trigger the download, passing the filename
+            val downloadId = triggerDownload(this@MainActivity, url, fileName)
+            if (downloadId == -1L) return@launch // Crash safeguard
+
+            // 3. Setup the Database
+            val db = AppDatabase.getDatabase(this@MainActivity)
+            val videoDao = db.videoDao()
+            val currentPartNumber = videoDao.getMaxPartNumberForCollection(collectionName) + 1
+
+            // 4. Create the Database Entity with the TRUE path
+            val newVideo = SavedVideo(
+                collectionName = collectionName,
+                videoUrl = url,
+                partNumber = currentPartNumber,
+                localVideoPath = expectedFile.absolutePath // FIXED: Save the real path now!
+            )
+
+            // 5. Save to Room and grab the true ID
+            val generatedID = videoDao.insertVideo(newVideo)
+            val videoWithId = newVideo.copy(id = generatedID.toString().toInt())
+
+            // 6. LINK THEM TOGETHER!
+            pendingDownloads[downloadId] = videoWithId
         }
     }
 
-    fun triggerDownload(context: Context, videoUrl: String) {
+    // FIXED: Added fileName as a parameter
+    fun triggerDownload(context: Context, videoUrl: String, fileName: String): Long {
         try {
             val uri = Uri.parse(videoUrl)
             val request = DownloadManager.Request(uri)
 
-            // Inject Cookies from the WebView so TikTok doesn't give a 403 error
             val cookies = CookieManager.getInstance().getCookie("https://www.tiktok.com")
-            if (cookies != null) {
-                request.addRequestHeader("Cookie", cookies)
-            }
+            if (cookies != null) request.addRequestHeader("Cookie", cookies)
 
-// Spoof the exact User-Agent we used to scrape the data
             request.addRequestHeader("User-Agent", DESKTOP_USER_AGENT)
             request.addRequestHeader("Referer", "https://www.tiktok.com/")
 
-            val fileName = "TikTok_${System.currentTimeMillis()}.mp4"
-            request.setDestinationInExternalPublicDir(Environment.DIRECTORY_MOVIES, "TikTokDL/$fileName")
+            // FIXED: Use the filename passed from the save function
+            request.setDestinationInExternalFilesDir(context, Environment.DIRECTORY_MOVIES, "TikTokDL/$fileName")
 
             request.setTitle("Downloading Video")
             request.setDescription("Saving TikTok to your device...")
             request.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
 
             val downloadManager = context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
-            downloadManager.enqueue(request)
+            val downloadID = downloadManager.enqueue(request)
 
             Log.d("TiktokExtractor", "Success! Download enqueued as: $fileName")
+            return downloadID
 
         } catch (e: Exception) {
             Log.e("TiktokExtractor", "Download crashed: ${e.message}")
+            return -1L
+        }
+    }
+    private val downloadCompleteReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action == DownloadManager.ACTION_DOWNLOAD_COMPLETE) {
+                val downloadId = intent.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -1L)
+
+                // Did WE trigger this download?
+                val pendingVideo = pendingDownloads[downloadId]
+                if (pendingVideo != null) {
+                    pendingDownloads.remove(downloadId) // Clear it from memory
+
+                    val downloadManager = getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+                    val query = DownloadManager.Query().setFilterById(downloadId)
+                    val cursor = downloadManager.query(query)
+
+                    if (cursor.moveToFirst()) {
+                        val status = cursor.getInt(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS))
+                        if (status == DownloadManager.STATUS_SUCCESSFUL) {
+
+                            // 🚨 FIXED: Use the REAL path we saved earlier! No more content:// crashes!
+                            val downloadedFile = File(pendingVideo.localVideoPath!!)
+
+                            Toast.makeText(this@MainActivity, "Download Complete! Starting AI...", Toast.LENGTH_SHORT).show()
+
+                            // FIRE THE AI PIPELINE!
+                            lifecycleScope.launch {
+                                val db = AppDatabase.getDatabase(this@MainActivity)
+                                translateVideoOffline(this@MainActivity, pendingVideo, downloadedFile, db)
+                            }
+                        }
+                    }
+                    cursor.close()
+                }
+            }
         }
     }
 
@@ -524,6 +600,7 @@ class MainActivity : ComponentActivity() {
                             Icon(Icons.Default.Folder, contentDescription = "Folder", modifier = Modifier.size(48.dp), tint = MaterialTheme.colorScheme.primary)
                             Spacer(modifier = Modifier.height(8.dp))
                             Text(collection, style = MaterialTheme.typography.titleMedium)
+
                         }
                     }
                 }
@@ -536,6 +613,9 @@ class MainActivity : ComponentActivity() {
     fun CollectionVideosScreen(collectionName: String, onBackClick: () -> Unit) {
         var videos by remember { mutableStateOf(emptyList<SavedVideo>()) }
 
+        // NEW: This state tracks if we are currently watching a video!
+        var selectedVideo by remember { mutableStateOf<SavedVideo?>(null) }
+
         LaunchedEffect(collectionName) {
             val db = AppDatabase.getDatabase(this@MainActivity)
             db.videoDao().getVideosForCollection(collectionName).collect { dbVideos ->
@@ -543,6 +623,17 @@ class MainActivity : ComponentActivity() {
             }
         }
 
+        // If the user clicked a video, show the full-screen player instead of the gallery
+        if (selectedVideo != null) {
+            VideoPlayerScreen(
+                videoPath = selectedVideo!!.localVideoPath!!,
+                subtitlePath = selectedVideo!!.srtFilePath, // Pass the subtitle path!
+                onClose = { selectedVideo = null } // Go back to the gallery
+            )
+            return // Stop drawing the rest of the screen
+        }
+
+        // Otherwise, show the normal Gallery Grid
         Scaffold(
             topBar = {
                 TopAppBar(
@@ -575,7 +666,12 @@ class MainActivity : ComponentActivity() {
                             modifier = Modifier.fillMaxWidth().aspectRatio(0.56f),
                             colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer),
                             onClick = {
-                                Toast.makeText(this@MainActivity, "Clicked video ID: ${video.id}", Toast.LENGTH_SHORT).show()
+                                if (video.localVideoPath != null && File(video.localVideoPath!!).exists()) {
+                                    // FIXED: Pass the whole video object so we have the subtitles too!
+                                    selectedVideo = video
+                                } else {
+                                    Toast.makeText(this@MainActivity, "Video is still processing or file not found!", Toast.LENGTH_SHORT).show()
+                                }
                             }
                         ) {
                             Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
@@ -584,6 +680,309 @@ class MainActivity : ComponentActivity() {
                         }
                     }
                 }
+            }
+        }
+    }
+
+
+
+    // TRANSLATE VIDEO CODE
+    fun decodeWaveFile(file: File): FloatArray {
+        val bytes = file.readBytes()
+        // A standard WAV header is 44 bytes. We skip it to get to the raw audio data.
+        val headerSize = 44
+        val payloadSize = bytes.size - headerSize
+        val floatArray = FloatArray(payloadSize / 2) // 16-bit PCM = 2 bytes per float
+
+        val byteBuffer = ByteBuffer.wrap(bytes, headerSize, payloadSize)
+        byteBuffer.order(ByteOrder.LITTLE_ENDIAN)
+
+        for (i in floatArray.indices) {
+            // Convert the 16-bit integer to a 32-bit float between -1.0 and 1.0
+            floatArray[i] = byteBuffer.short / 32768.0f
+        }
+        return floatArray
+    }
+
+    fun extractAudioForWhisper(videoFile: File, onComplete: (File?) -> Unit) {
+        // Create a temporary WAV file in the app's cache directory
+        val wavFile = File(videoFile.parent, "${videoFile.nameWithoutExtension}.wav")
+
+        // The exact command Whisper requires: 16kHz (-ar 16000), 1 Channel/Mono (-ac 1), 16-bit PCM
+        val ffmpegCommand = "-i \"${videoFile.absolutePath}\" -ar 16000 -ac 1 -c:a pcm_s16le \"${wavFile.absolutePath}\""
+
+        // Run FFmpeg in the background
+        FFmpegKit.executeAsync(ffmpegCommand) { session ->
+            val returnCode = session.returnCode
+
+            if (ReturnCode.isSuccess(returnCode)) {
+                Log.d("WhisperPipeline", "Audio extracted successfully: ${wavFile.name}")
+                onComplete(wavFile)
+            } else {
+                Log.e("WhisperPipeline", "Audio extraction failed! Logs: ${session.failStackTrace}")
+                onComplete(null)
+            }
+        }
+    }
+
+    fun copyModelToStorage(context: Context, modelName: String): File { //allows the model to be copied to the internal storage during runtime
+        val modelFile = File(context.filesDir, modelName)
+        // Only copy if it doesn't already exist to save time
+        if (!modelFile.exists()) {
+            context.assets.open(modelName).use { inputStream ->
+                FileOutputStream(modelFile).use { outputStream ->
+                    inputStream.copyTo(outputStream)
+                }
+            }
+        }
+        return modelFile
+    }
+
+//    private val downloadReceiver = object : BroadcastReceiver() {
+//        override fun onReceive(context: Context?, intent: Intent?) {
+//            if (intent?.action == DownloadManager.ACTION_DOWNLOAD_COMPLETE) {
+//                val downloadId = intent.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -1L)
+//
+//                // Look up the exact video entity based on the download ID!
+//                val pendingVideo = pendingDownloads[downloadId]
+//
+//                if (pendingVideo != null && context != null) {
+//                    pendingDownloads.remove(downloadId) // Clean up the map
+//
+//                    val downloadManager = context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+//                    val query = DownloadManager.Query().setFilterById(downloadId)
+//                    val cursor = downloadManager.query(query)
+//
+//                    if (cursor.moveToFirst()) {
+//                        val status = cursor.getInt(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_STATUS))
+//
+//                        if (status == DownloadManager.STATUS_SUCCESSFUL) {
+//                            // Let Android tell us EXACTLY where it put the file
+//                            val uriString = cursor.getString(cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_LOCAL_URI))
+//                            val downloadedFile = File(Uri.parse(uriString).path!!)
+//
+//                            Toast.makeText(context, "Download Complete! Starting AI...", Toast.LENGTH_SHORT).show()
+//
+//                            // Launch the translation with ALL required parameters
+//                            lifecycleScope.launch {
+//                                val db = AppDatabase.getDatabase(context)
+//                                translateVideoOffline(context, pendingVideo, downloadedFile, db)
+//                            }
+//                        } else {
+//                            Log.e("WhisperPipeline", "Download failed with status code: $status")
+//                        }
+//                    }
+//                    cursor.close()
+//                }
+//            }
+//        }
+//    }
+
+
+
+    override fun onDestroy() {
+        super.onDestroy()
+        unregisterReceiver(downloadCompleteReceiver)
+    }
+
+    private fun convertTextToBasicSrt(rawText: String): String {
+        val srtBuilder = StringBuilder()
+        // Split the giant text block into individual sentences
+        val chunks = rawText.split(Regex("(?<=[.!?])\\s+")).filter { it.isNotBlank() }
+        var startTimeSeconds = 0
+
+        chunks.forEachIndexed { index, text ->
+            val endTimeSeconds = startTimeSeconds + 3 // Show each sentence for 3 seconds
+
+            srtBuilder.append("${index + 1}\n")
+            srtBuilder.append("${formatSrtTime(startTimeSeconds)} --> ${formatSrtTime(endTimeSeconds)}\n")
+            srtBuilder.append("$text\n\n")
+
+            // Move start time forward for the next sentence
+            startTimeSeconds = endTimeSeconds
+        }
+        return srtBuilder.toString()
+    }
+
+    private fun formatSrtTime(totalSeconds: Int): String {
+        val hours = totalSeconds / 3600
+        val minutes = (totalSeconds % 3600) / 60
+        val seconds = totalSeconds % 60
+        // SRT requires the format HH:MM:SS,mmm
+        return String.format("%02d:%02d:%02d,000", hours, minutes, seconds)
+    }
+    suspend fun translateVideoOffline(
+        context: Context,
+        videoEntity: SavedVideo,
+        mp4File: File,
+        db: AppDatabase
+    ) {
+        withContext(Dispatchers.IO) {
+            val dramaName = videoEntity.collectionName
+            val partNumber = videoEntity.partNumber
+
+            val displayTitle = "$dramaName - Part $partNumber"
+            val safeFileName = "${dramaName.replace(Regex("[^A-Za-z0-9 ]"), "_")}_Part_${partNumber.toString().padStart(2)}"
+
+            try {
+                var activeVideoFile = mp4File
+                val finalMp4File = File(mp4File.parent, "${safeFileName}.mp4")
+
+                if (mp4File.exists() && mp4File.absolutePath != finalMp4File.absolutePath) {
+                    mp4File.copyTo(finalMp4File, overwrite = true)
+                    if (finalMp4File.exists()) {
+                        mp4File.delete()
+                        activeVideoFile = finalMp4File // Update our variable to use the new file!
+                    }
+                }
+
+                // Save the MP4 path to the database right now, just in case AI crashes later!
+                videoEntity.localVideoPath = activeVideoFile.absolutePath
+                db.videoDao().updateVideo(videoEntity)
+
+                updateProcessingNotification(context, displayTitle, "1/4: Extracting audio...")
+                Log.d("WhisperPipeline", "1. Starting FFmpeg Audio Extraction...")
+                val wavFile = File(context.cacheDir, "temp_audio.wav")
+                if (wavFile.exists()) wavFile.delete()
+
+                // 🚨 IMPORTANT: Use activeVideoFile here, NOT mp4File!
+                val ffmpegCommand = "-i \"${activeVideoFile.absolutePath}\" -ar 16000 -ac 1 -c:a pcm_s16le \"${wavFile.absolutePath}\""
+                com.arthenica.ffmpegkit.FFmpegKit.execute(ffmpegCommand)
+
+                updateProcessingNotification(context, displayTitle, "2/4: Loading AI Model...")
+                Log.d("WhisperPipeline", "2. Loading AI Model...")
+                val modelFile = copyModelToStorage(context, "ggml-tiny.bin")
+                val whisperContext = WhisperContext.createContextFromFile(modelFile.absolutePath)
+
+                updateProcessingNotification(context, displayTitle, "3/4: Preparing audio data...")
+                Log.d("WhisperPipeline", "3. Loading Audio into Memory...")
+                val audioData = decodeWaveFile(wavFile)
+
+                updateProcessingNotification(context, displayTitle, "4/4: AI is translating ")
+                Log.d("WhisperPipeline", "4. AI Processing Audio...")
+
+                // 🚨 IMPORTANT: Use transcribeDataToSrt!
+                val raw = whisperContext.transcribeData(audioData)
+                val srtContent = convertTextToBasicSrt(raw)
+
+
+                val srtFile = File(activeVideoFile.parent, "${safeFileName}.srt")
+                srtFile.writeText(srtContent)
+
+                videoEntity.srtFilePath = srtFile.absolutePath
+                db.videoDao().updateVideo(videoEntity)
+
+                withContext(Dispatchers.Main) {
+                    updateProcessingNotification(context, displayTitle, "Subtitle Complete", isComplete = true)
+                }
+
+                Log.d("WhisperPipeline", "SUCCESS! Output saved to:\n${srtFile.absolutePath}")
+
+                whisperContext.release()
+                wavFile.delete()
+
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    updateProcessingNotification(context, displayTitle, "Error: AI Crashed", isComplete = true)
+                }
+                Log.e("WhisperPipeline", "Pipeline Crashed: ${e.message}")
+            }
+        }
+    }
+
+    private fun updateProcessingNotification(
+        context: Context,
+        videoTitle: String, // NEW: Pass the title in!
+        stepText: String,
+        isComplete: Boolean = false
+    ) {
+        val notificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        val channelId = "whisper_processing_channel"
+
+        val channel = NotificationChannel(
+            channelId,
+            "AI Translation Progress",
+            NotificationManager.IMPORTANCE_LOW
+        )
+        notificationManager.createNotificationChannel(channel)
+
+        // Update the title to show the specific video!
+        val title = if (isComplete) "Finished: $videoTitle" else "Translating: $videoTitle"
+
+        val builder = NotificationCompat.Builder(context, channelId)
+            .setSmallIcon(android.R.drawable.ic_popup_sync)
+            .setContentTitle(title)
+            .setContentText(stepText)
+            .setOngoing(!isComplete)
+            .setProgress(0, 0, !isComplete)
+
+        notificationManager.notify(1, builder.build())
+    }
+
+    @Composable
+    fun VideoPlayerScreen(videoPath: String, subtitlePath: String?, onClose: () -> Unit) {
+        val context = androidx.compose.ui.platform.LocalContext.current
+
+        // Initialize ExoPlayer
+        val exoPlayer = remember {
+            androidx.media3.exoplayer.ExoPlayer.Builder(context).build().apply {
+
+                // 1. Start building the media item with the Video File
+                val mediaItemBuilder = androidx.media3.common.MediaItem.Builder()
+                    .setUri(Uri.fromFile(File(videoPath)))
+
+                // 2. If we have a subtitle file, attach it!
+                if (subtitlePath != null && File(subtitlePath).exists()) {
+                    val subtitleConfig = androidx.media3.common.MediaItem.SubtitleConfiguration.Builder(Uri.fromFile(File(subtitlePath)))
+                        .setMimeType(androidx.media3.common.MimeTypes.APPLICATION_SUBRIP) // Tells ExoPlayer it's an .srt file
+                        .setLanguage("en")
+                        .setSelectionFlags(androidx.media3.common.C.SELECTION_FLAG_DEFAULT)
+                        .build()
+
+                    mediaItemBuilder.setSubtitleConfigurations(listOf(subtitleConfig))
+                }
+
+                setMediaItem(mediaItemBuilder.build())
+
+                // 3. Force the player to show English subtitles automatically
+                trackSelectionParameters = trackSelectionParameters
+                    .buildUpon()
+                    .setPreferredTextLanguage("en")
+                    .build()
+
+                prepare()
+                playWhenReady = true
+            }
+        }
+
+        // Clean up the player to prevent memory leaks
+        DisposableEffect(Unit) {
+            onDispose {
+                exoPlayer.release()
+            }
+        }
+
+        Box(modifier = Modifier.fillMaxSize().background(androidx.compose.ui.graphics.Color.Black)) {
+            AndroidView(
+                factory = { ctx ->
+                    androidx.media3.ui.PlayerView(ctx).apply {
+                        player = exoPlayer
+                        useController = true
+                    }
+                },
+                modifier = Modifier.fillMaxSize()
+            )
+
+            // Back button
+            IconButton(
+                onClick = onClose,
+                modifier = Modifier.padding(16.dp).align(Alignment.TopStart)
+            ) {
+                Icon(
+                    Icons.Default.ArrowBack,
+                    contentDescription = "Close Video",
+                    tint = androidx.compose.ui.graphics.Color.White
+                )
             }
         }
     }

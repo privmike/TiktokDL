@@ -13,7 +13,6 @@ import androidx.room.Room
 import androidx.room.RoomDatabase
 import kotlinx.coroutines.flow.Flow
 
-// 1. The Table
 @Entity(tableName = "saved_videos")
 data class SavedVideo(
     @PrimaryKey(autoGenerate = true) val id: Int = 0,
@@ -21,23 +20,25 @@ data class SavedVideo(
     val collectionName: String,
     val savedAtTimestamp: Long = System.currentTimeMillis(),
     var partNumber : Int,
-    var localVideoPath: String? = null, // ADDED: To store your renamed MP4 path!
+    var localVideoPath: String? = null,
     var srtFilePath : String? = null
 )
 
-// 2. The Queries
+@Entity(tableName = "video_collections")
+data class VideoCollection(
+    @PrimaryKey val name: String, // The name is the unique ID
+    val createdAt: Long = System.currentTimeMillis()
+)
+
+
+
 @Dao
 interface VideoDao {
-    // FIXED: Return Long so you can get the generated ID!
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertVideo(video: SavedVideo): Long
 
-    // ADDED: The Update function!
     @Update
     suspend fun updateVideo(video: SavedVideo)
-
-    @Query("SELECT DISTINCT collectionName FROM saved_videos")
-    fun getAllCollections(): Flow<List<String>>
 
     @Query("SELECT * FROM saved_videos WHERE collectionName = :collection")
     suspend fun getVideosByCollection(collection: String): List<SavedVideo>
@@ -49,10 +50,21 @@ interface VideoDao {
     suspend fun getMaxPartNumberForCollection(collectionName: String): Int
 }
 
-// 3. The Database Connection
-@Database(entities = [SavedVideo::class], version = 1, exportSchema = false)
+@Dao
+interface CollectionDao {
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertCollection(collection: VideoCollection)
+
+    // Notice we return Flow<List<String>> to perfectly match your existing UI code!
+    @Query("SELECT name FROM video_collections ORDER BY createdAt DESC")
+    fun getAllCollections(): Flow<List<String>>
+}
+
+
+@Database(entities = [SavedVideo::class, VideoCollection::class], version = 2, exportSchema = false)
 abstract class AppDatabase : RoomDatabase() {
     abstract fun videoDao(): VideoDao
+    abstract fun collectionDao(): CollectionDao // NEW!
 
     companion object {
         @Volatile
@@ -64,7 +76,10 @@ abstract class AppDatabase : RoomDatabase() {
                     context.applicationContext,
                     AppDatabase::class.java,
                     "tiktok_gallery_database"
-                ).build()
+                )
+                    // 🚨 IMPORTANT: This prevents a crash when adding a new table!
+                    .fallbackToDestructiveMigration()
+                    .build()
                 INSTANCE = instance
                 instance
             }

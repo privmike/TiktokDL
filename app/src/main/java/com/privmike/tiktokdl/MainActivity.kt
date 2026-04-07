@@ -49,6 +49,8 @@ import com.arthenica.ffmpegkit.FFmpegKit
 import com.arthenica.ffmpegkit.ReturnCode
 import com.privmike.tiktokdl.data.AppDatabase
 import com.privmike.tiktokdl.data.SavedVideo
+import com.privmike.tiktokdl.data.VideoCollection
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -349,6 +351,7 @@ class MainActivity : ComponentActivity() {
 
             // 3. Setup the Database
             val db = AppDatabase.getDatabase(this@MainActivity)
+            db.collectionDao().insertCollection(VideoCollection(name = collectionName))
             val videoDao = db.videoDao()
             val currentPartNumber = videoDao.getMaxPartNumberForCollection(collectionName) + 1
 
@@ -446,7 +449,7 @@ class MainActivity : ComponentActivity() {
 
         LaunchedEffect(Unit) {
             val db = AppDatabase.getDatabase(this@MainActivity)
-            db.videoDao().getAllCollections().collect { dbCollections ->
+            db.collectionDao().getAllCollections().collect { dbCollections ->
                 if (dbCollections.isNotEmpty()) {
                     collections = dbCollections
                 }
@@ -480,7 +483,12 @@ class MainActivity : ComponentActivity() {
                             Card(
                                 modifier = Modifier.fillMaxWidth(),
                                 colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
-                                onClick = { saveVideoToCollection(extractedVideoUrl!!, collectionName) }
+                                onClick = {
+                                    saveVideoToCollection(extractedVideoUrl!!, collectionName)
+                                    val homeIntent = Intent(this@MainActivity, MainActivity::class.java)
+                                    homeIntent.flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
+                                    startActivity(homeIntent)
+                                }
                             ) {
                                 Row(
                                     modifier = Modifier.padding(16.dp),
@@ -531,6 +539,10 @@ class MainActivity : ComponentActivity() {
                             if (newCollectionName.isNotBlank()) {
                                 saveVideoToCollection(extractedVideoUrl!!, newCollectionName)
                                 showCreateDialog = false
+
+                                val homeIntent = Intent(this@MainActivity, MainActivity::class.java)
+                                homeIntent.flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
+                                startActivity(homeIntent)
                             }
                         }
                     ) { Text("Save Here") }
@@ -547,9 +559,12 @@ class MainActivity : ComponentActivity() {
     fun MainGalleryScreen(onCollectionClick: (String) -> Unit) {
         var collections by remember { mutableStateOf(listOf("My Favorites")) }
 
+        var showCreateDialog by remember { mutableStateOf(false) }
+        var newCollectionName by remember { mutableStateOf("") }
+        val context = androidx.compose.ui.platform.LocalContext.current
         LaunchedEffect(Unit) {
             val db = AppDatabase.getDatabase(this@MainActivity)
-            db.videoDao().getAllCollections().collect { dbCollections ->
+            db.collectionDao().getAllCollections().collect { dbCollections ->
                 if (dbCollections.isNotEmpty()) {
                     collections = dbCollections
                 }
@@ -578,6 +593,11 @@ class MainActivity : ComponentActivity() {
                         titleContentColor = MaterialTheme.colorScheme.onPrimaryContainer
                     )
                 )
+            },
+            floatingActionButton = {
+                FloatingActionButton(onClick = { showCreateDialog = true }) {
+                    Icon(Icons.Default.Add, contentDescription = "New Collection")
+                }
             }
         ) { padding ->
             LazyVerticalGrid(
@@ -605,6 +625,38 @@ class MainActivity : ComponentActivity() {
                     }
                 }
             }
+        }
+        if (showCreateDialog) {
+            AlertDialog(
+                onDismissRequest = { showCreateDialog = false },
+                title = { Text("New Collection") },
+                text = {
+                    OutlinedTextField(
+                        value = newCollectionName,
+                        onValueChange = { newCollectionName = it },
+                        label = { Text("Collection Name") },
+                        singleLine = true
+                    )
+                },
+                confirmButton = {
+                    Button(
+                        onClick = {
+                            if (newCollectionName.isNotBlank()) {
+                                lifecycleScope.launch(Dispatchers.IO) {
+                                    val db = AppDatabase.getDatabase(context)
+                                    // Actually save it to the database!
+                                    db.collectionDao().insertCollection(com.privmike.tiktokdl.data.VideoCollection(name = newCollectionName))
+                                    showCreateDialog = false
+                                    newCollectionName = "" // Reset for next time
+                                }
+                            }
+                        }
+                    ) { Text("Create") }
+                },
+                dismissButton = {
+                    TextButton(onClick = { showCreateDialog = false }) { Text("Cancel") }
+                }
+            )
         }
     }
 
@@ -783,6 +835,8 @@ class MainActivity : ComponentActivity() {
     override fun onDestroy() {
         super.onDestroy()
         unregisterReceiver(downloadCompleteReceiver)
+        val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        notificationManager.cancelAll()
     }
 
     private fun convertTextToBasicSrt(rawText: String): String {
@@ -881,7 +935,14 @@ class MainActivity : ComponentActivity() {
                 whisperContext.release()
                 wavFile.delete()
 
-            } catch (e: Exception) {
+            } catch (e: CancellationException){
+                withContext(Dispatchers.Main) {
+                    updateProcessingNotification(context, displayTitle, "Translation Stopped", isComplete = true)
+                }
+                Log.e("WhisperPipeline", "Translation was cancelled (App Closed).")
+                throw e
+            }
+            catch (e: Exception) {
                 withContext(Dispatchers.Main) {
                     updateProcessingNotification(context, displayTitle, "Error: AI Crashed", isComplete = true)
                 }
